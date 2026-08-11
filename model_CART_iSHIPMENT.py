@@ -15,6 +15,7 @@ model.m = Set() # Manufacturing sites
 model.p = Set() # Patients
 model.t = RangeSet(130) # Time
 model.tt = Set(initialize=model.t) # Alias of set t
+model.CBT = set(initialize=[7]) # widen the range to possible BT later
 
 # Indexed PARAMETERS
 model.CIM = Param(model.m) # Capital investment for manufacturing facility
@@ -58,6 +59,8 @@ model.MSO = Var(model.p, model.m, model.h, model.j, model.t, within=NonNegativeR
 model.OUTC = Var(model.p, model.c, model.t, within=NonNegativeReals)
 model.OUTM = Var(model.p, model.m, model.t, within=NonNegativeReals)
 model.INM = Var(model.p, model.m, model.t, within=NonNegativeReals)
+model.DB = Var(model.p, model.CBT, within = Binary) # 1 if [p] batch time is equal to CBT time steps
+model.INMCBT = Var(model.p, model.m, model.CBT, model.t, within=NonNegativeReals) # 
 model.DURV = Var(model.p, model.m, model.t, within=NonNegativeReals) # 1 only for the time period t in which a therapy p is manufactured in facility m
 model.RATIO = Var(model.m, model.t, within=NonNegativeReals) # the percentage of utilisation of MS site m at time t
 
@@ -123,6 +126,17 @@ model.MSB7 = Constraint(model.p, model.c, model.t, rule=MSB7_rule)
 def MSB5_rule(model,p,m,t):
     return model.INM[p,m,t] == sum(model.LSA[p,c,m,j,t] for c in model.c for j in model.j)
 model.MSB5 = Constraint(model.p, model.m, model.t, rule=MSB5_rule)
+
+
+
+#MSB2 - NEW - duration indexed
+
+def CBTSum_rule(model,p):
+    return su
+
+
+
+
 
 #MSB2
 def MSB2_rule(model,p,m,t,tt):

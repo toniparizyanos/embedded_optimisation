@@ -1,8 +1,16 @@
 from pyomo.environ import *
+from surrogate_params import *      
+import surrogate_params as sp       
 from pyomo.common.timing import TicTocTimer
 from time import process_time
 import numpy as np
 import matplotlib.pyplot as plt
+import math
+import onnxruntime as ort
+from plot_utilisation_50p_20D import from_instance
+import os, sys
+import pickle
+
 model = AbstractModel()
 data = 'Data200_profileA.dat'
 t1_start = process_time()
@@ -15,17 +23,20 @@ model.m = Set() # Manufacturing sites
 model.p = Set() # Patients
 model.t = RangeSet(130) # Time
 model.tt = Set(initialize=model.t) # Alias of set t
-model.CBT = set(initialize=[7]) # widen the range to possible BT later
+model.CBT = Set(initialize=[10,11,12,13,14]) # widen the range to possible BT later
 
 # Indexed PARAMETERS
-model.CIM = Param(model.m) # Capital investment for manufacturing facility
+#model.CIM = Param(model.m) # Capital investment for manufacturing facility
 model.FCAP = Param(model.m) # Total capacity of manufacturing site
+model.CIM = Param(model.m, initialize=cim_init) # the new CIM where the vlue is from the surrogate
 model.TT1 = Param(model.j) # Transport time LS to MS using transport mode j
 model.TT3 = Param(model.j) # Transport time MS to hospital using transport mode j
 model.U1 = Param(model.c, model.m, model.j) # Unit transport cost LS to MS using transport mode j
 model.U3 = Param(model.m, model.h, model.j) # Unit transport cost MS to hospital using transport mode j
 model.INC = Param(model.p, model.c, model.t, initialize=0) # Demand therapy p arriving for leukapheresis at LS site c at time t
-model.CVM = Param(model.m, default={'m1':20920, 'm2':156900, 'm3':52300, 'm4':20920, 'm5':156900, 'm6':52300}) #Fixed variable costs
+#model.CVM = Param(model.m, default={'m1':20920, 'm2':156900, 'm3':52300, 'm4':20920, 'm5':156900, 'm6':52300}) #Fixed variable costs
+model.CVM = Param(model.m, initialize = cvm_init) #Fixed variable costs from the surrogates
+
 
 
 # Scalar PARAMETERS
@@ -37,7 +48,7 @@ model.TMFE = Param(default=7) # Duration of manufacturing excluding QC
 model.TQC = Param(default=7) # Duration of QC
 model.C_material = Param(default=10476) # Materials cost per therapy
 model.CQC= Param(default=9312) # QC cost per therapy
-model.ND = Param(default = 18) # Maximum turnaround (vein-to-vein) time
+model.ND = Param(default = 22) # Maximum turnaround (vein-to-vein) time it was 18, relaxed it for now. at 21 you need both j1 and j2
 
 # Binary VARIABLES
 model.E1 = Var(model.m, within=Binary) # 1 if manufacturing facility m is established
@@ -63,6 +74,11 @@ model.DB = Var(model.p, model.CBT, within = Binary) # 1 if [p] batch time is equ
 model.INMCBT = Var(model.p, model.m, model.CBT, model.t, within=NonNegativeReals) # 
 model.DURV = Var(model.p, model.m, model.t, within=NonNegativeReals) # 1 only for the time period t in which a therapy p is manufactured in facility m
 model.RATIO = Var(model.m, model.t, within=NonNegativeReals) # the percentage of utilisation of MS site m at time t
+model.t_at = Var(model.p, bounds = (2.0,3.0))       # the A&T duration, bounded between 1 - 3 as it is in the dataset
+model.BT = Var(model.p, within=NonNegativeReals)    # this is the batch time in exact times (not integer), it will be forced to an integer value later
+model.OPEX = Var(model.p, within=NonNegativeReals) # new opex term
+
+
 
 
 # VARIABLES
@@ -75,7 +91,7 @@ model.CTT = Var(model.p) # Completion time of treatment for patient p
 
 # OBJECTIVE FUNCTION
 def obj_rule(model):
-    return sum( model.CTM[p]for p in model.p )+ sum( model.TTC[p] for p in model.p ) + (model.C_material + model.CQC)* len(model.p)
+    return sum( model.CTM[p]for p in model.p ) + sum( model.TTC[p] for p in model.p ) + sum(model.OPEX[p] for p in model.p)
 model.obj = Objective( rule=obj_rule )
 
 
@@ -127,24 +143,61 @@ def MSB5_rule(model,p,m,t):
     return model.INM[p,m,t] == sum(model.LSA[p,c,m,j,t] for c in model.c for j in model.j)
 model.MSB5 = Constraint(model.p, model.m, model.t, rule=MSB5_rule)
 
+#----------------------------------------------------------------------------------------------------------
 
+#----------------------------------------------------------------------------------------------------------
 
 #MSB2 - NEW - duration indexed
+def DBSUM_rule(model,p):
+    return sum(model.DB[p, d] for d in model.CBT) == 1
+model.DBSUM = Constraint(model.p, rule=DBSUM_rule)
 
-def CBTSum_rule(model,p):
-    return su
+def INMSPLIT_rule(model,p,m,t):
+    return model.INM[p,m,t] == sum(model.INMCBT[p,m,d,t] for d in model.CBT)
+model.INMSPLIT = Constraint(model.p, model.m, model.t, rule=INMSPLIT_rule)
+
+def INMS_rule(model,p,m,d,t):
+    return model.INMCBT[p,m,d,t] <= model.DB[p, d]
+model.INMS = Constraint(model.p, model.m, model.CBT, model.t, rule=INMS_rule)
+
+def MSB2_rule(model,p,m,tt):
+    terms = [model.INMCBT[p,m,d,tt-d] for d in model.CBT if (tt-d) in model.t]
+    if not terms:
+        return model.OUTM[p,m,tt] == 0
+    return model.OUTM[p,m,tt] == sum(terms)
+model.MSB2 = Constraint(model.p, model.m, model.t, rule=MSB2_rule)
+
+#Linear model - mapping A&T duration to the batch time
+def batch_t_rule(model, p):
+    return model.BT[p] == 2.0 * model.t_at[p] + 7.4755
+model.batch_t = Constraint(model.p, rule=batch_t_rule)
+
+
+#Constraint so the batch time occupies an integer amount of days on the grid
+
+def grid_days_rule(model,p):
+    return sum(d*model.DB[p,d] for d in model.CBT) >= model.BT[p]
+model.grid_days = Constraint(model.p, rule=grid_days_rule)
+
+
+#Opex calculation, phi is the ratio of opex that depends on batch -- (1-phi) is therefore the facility dependent opex
+
+def opex_rule(model,p):
+    return model.OPEX[p] == PHI * OPEX_ref
+model.OPEX_def = Constraint(model.p, rule=opex_rule)
 
 
 
+#----------------------------------------------------------------------------------------------------------
 
-
-#MSB2
-def MSB2_rule(model,p,m,t,tt):
-    if tt == t + model.TMFE:
-        return model.INM[p,m,t] == model.OUTM[p,m,tt]
-    else:
-        return Constraint.Skip
-model.MSB2 = Constraint(model.p, model.m, model.t, model.tt, rule=MSB2_rule)
+#----------------------------------------------------------------------------------------------------------
+# #MSB2 OLD
+# def MSB2_rule(model,p,m,t,tt):
+#     if tt == t + model.TMFE:
+#         return model.INM[p,m,t] == model.OUTM[p,m,tt]
+#     else:
+#         return Constraint.Skip
+# model.MSB2 = Constraint(model.p, model.m, model.t, model.tt, rule=MSB2_rule)
 
 #MSB8
 def MSB8_rule(model,p,m,t,tt):
@@ -170,9 +223,21 @@ model.MSB6 = Constraint(model.p, model.h, model.t, rule=MSB6_rule)
 
 
 # Capacity constraints
+# OLD Capacity rule uses the fied TMFE
+# def CAP1_rule(model,m,t):
+#     return model.CAP[m,t] == model.FCAP[m]-sum(model.INM[p,m,tt] for p in model.p for tt in model.tt if tt<t and tt>=t-model.TMFE)
+# model.CAP1 = Constraint(model.m, model.t, rule=CAP1_rule)
+
+#----------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------
 def CAP1_rule(model,m,t):
-    return model.CAP[m,t] == model.FCAP[m]-sum(model.INM[p,m,tt] for p in model.p for tt in model.tt if tt<t and tt>=t-model.TMFE)
+    return model.CAP[m,t] == model.FCAP[m] - sum(model.INMCBT[p,m,d,tt] for p in model.p for d in model.CBT for tt in model.tt if tt<t and tt >=t-d)
 model.CAP1 = Constraint(model.m, model.t, rule=CAP1_rule)
+
+
+#----------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------
+
 
 
 def CAPCON1_rule(model,m,t):
@@ -323,6 +388,15 @@ timer.tic('start')
 print('-----------------------------------------------Building model-----------------------------------------------------')
 print('------------------------------------------------------------------------------------------------------------------')
 instance = model.create_instance(data)
+
+theta = sample_theta(list(instance.p))          
+attach_opex_surrogate(instance, theta)          
+
+RUN_DIR = f'2resultsms_{len(instance.p)}p_ND{int(round(value(instance.ND)))}'
+os.makedirs(RUN_DIR, exist_ok=True)
+sys.stdout = open(os.path.join(RUN_DIR, 'results.log'), 'w')
+
+
 timer.toc('Built model')
 
 
@@ -392,7 +466,8 @@ for p in instance.p:
         for t in instance.t:
             if t<130:
                 if (value(instance.DURV[p,m,t+1])-value(instance.DURV[p,m,t]))**2 == 1:
-                    print('Therapy',p,'is manufactured at site',m,'for the time period','t{}'.format(t),'-','t{}'.format(t+ instance.TMFE))
+                    d_p = [d for d in instance.CBT if value(instance.DB[p,d])>0.5][0]
+                    print('Therapy',p,'is manufactured at site',m,'for the time period','t{}'.format(t),'-','t{}'.format(t+d_p))
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
@@ -477,8 +552,10 @@ print('-------------------------------------------------------------------------
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
+print('------------------------------------------------theta(p)----------------------------------------------------------------') 
 print('-----------------------------------------------------------------------------------------------------------------------')
-print('-----------------------------------------------------------------------------------------------------------------------')
+for p in instance.p:
+    print('Enriched T-cell fraction','of therapy' ,p,'is',theta[p])
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
@@ -499,9 +576,116 @@ obj_val = value(instance.obj)
 print('Total cost=',obj_val)
 print('Average manufacturing cost per therapy', value(sum(instance.CTM[p] for p in instance.p))/len(instance.p))
 print('Average transport cost per therapy', value(sum(instance.TTC[p] for p in instance.p))/len(instance.p))
-print('Average QC cost per therapy',(10476+9312))
+
+#print('Average QC cost per therapy',(10476+9312))
+print('Average manufacturing OPEX per therapy', value(sum(instance.OPEX[p] for p in instance.p))/len(instance.p))
 print('Average cost per therapy',obj_val/len(instance.p))
 print('Average return time =',np.rint(value(instance.ATRT)))
+print('OPEX range: $%.0f - $%.0f' % (
+    min(value(instance.OPEX[p]) for p in instance.p),
+    max(value(instance.OPEX[p]) for p in instance.p)))
+print('t_at range: %.3f - %.3f days' % (
+    min(value(instance.t_at[p]) for p in instance.p),
+    max(value(instance.t_at[p]) for p in instance.p)))
+print('BT range:   %.3f - %.3f days' % (
+    min(value(instance.BT[p]) for p in instance.p),
+    max(value(instance.BT[p]) for p in instance.p)))
+print('CBT used:', sorted({d for p in instance.p for d in instance.CBT
+                           if value(instance.DB[p,d]) > 0.5}))
+
+# =====================================================================
+# POST-SOLVE DIAGNOSTICS  - paste after the existing result prints
+# =====================================================================
+
+print('\n' + '='*70)
+print('DIAGNOSTICS')
+print('='*70)
+
+P = list(instance.p)
+
+# --- 1. did the surrogate actually vary? --------------------------------
+op = [value(instance.OPEX[p]) for p in P]
+ta = [value(instance.t_at[p]) for p in P]
+bt = [value(instance.BT[p])   for p in P]
+print(f'OPEX  $ {min(op):>10,.0f} - {max(op):>10,.0f}   spread {max(op)-min(op):>9,.0f}'
+      f'   mean {np.mean(op):>10,.0f}')
+print(f't_at  d {min(ta):>10.4f} - {max(ta):>10.4f}   distinct {len(set(round(x,6) for x in ta))}')
+print(f'BT    d {min(bt):>10.4f} - {max(bt):>10.4f}')
+if max(op)-min(op) < 1.0:
+    print('  !! OPEX identical across patients - theta link may not be wired')
+if max(ta)-min(ta) < 1e-6:
+    print(f'  -> all patients at t_at = {ta[0]:.3f} '
+          f'({"lower" if ta[0] < 1.001 else "upper" if ta[0] > 2.999 else "interior"} bound)')
+
+# --- 2. does the MILP agree with a direct ONNX forward pass? ------------
+sess = ort.InferenceSession(sp.OPEX_ONNX_PATH)
+worst = 0.0
+for p in P:
+    xs = np.array([[sp._scale_in(theta[p], sp.I_THETA),
+                    sp._scale_in(sp.VV_COST, sp.I_VV),
+                    sp._scale_in(86400.0*value(instance.t_at[p]), sp.I_TAT)]])
+    ref = float(sess.run(None, {'input': xs.astype(np.float64)})[0].ravel()[0])
+    ref = sp.PHI*(ref*sp.Y_FACTOR + sp.Y_OFFSET)
+    worst = max(worst, abs(value(instance.OPEX[p]) - ref)/max(ref, 1e-9))
+print(f'\nMILP vs ONNX forward pass: worst relative error {worst:.2e}'
+      f'   {"OK" if worst < 1e-6 else "!! MISMATCH - check scaling"}')
+
+# --- 3. is the ceiling tight? -------------------------------------------
+bad = []
+for p in P:
+    d_sel = [d for d in instance.CBT if value(instance.DB[p,d]) > 0.5]
+    if len(d_sel) != 1:
+        bad.append((p, 'DB not one-hot', d_sel)); continue
+    if d_sel[0] != math.ceil(value(instance.BT[p]) - 1e-9):
+        bad.append((p, f'BT={value(instance.BT[p]):.4f}', d_sel[0]))
+print(f'ceiling check: {"all tight" if not bad else str(len(bad))+" violations"}')
+for b in bad[:5]:
+    print('   ', b)
+
+# --- 4. facility economics ----------------------------------------------
+print(f'\n{"site":<5}{"lines":>6}{"built":>7}{"batches":>9}{"util%":>8}'
+      f'{"CIM/day":>10}{"CVM/day":>11}{"fixed$/therapy":>16}')
+assign = {m: [] for m in instance.m}
+for p in P:
+    for m in instance.m:
+        if sum(value(instance.INM[p,m,t]) for t in instance.t) > 0.5:
+            assign[m].append(p)
+for m in instance.m:
+    built = value(instance.E1[m]) > 0.5
+    n = len(assign[m])
+    cap = value(instance.FCAP[m])*len(instance.t)/7
+    fixed = (value(instance.CIM[m])+value(instance.CVM[m]))*len(instance.t)
+    print(f'{m:<5}{value(instance.FCAP[m]):>6.0f}{str(built):>7}{n:>9}'
+          f'{100*n/cap if cap else 0:>7.1f}%{value(instance.CIM[m]):>10,.0f}'
+          f'{value(instance.CVM[m]):>11,.0f}'
+          f'{fixed/n if (built and n) else 0:>16,.0f}')
+
+# --- 5. objective decomposition -----------------------------------------
+ctm = value(sum(instance.CTM[p] for p in instance.p))
+ttc = value(sum(instance.TTC[p] for p in instance.p))
+opx = sum(op)
+tot = ctm+ttc+opx
+print(f'\n{"term":<28}{"total $":>16}{"per therapy":>14}{"share":>8}')
+for lbl, v in [('facility (CIM+CVM)', ctm), ('transport', ttc),
+               ('manufacturing OPEX', opx), ('TOTAL', tot)]:
+    print(f'{lbl:<28}{v:>16,.0f}{v/len(P):>14,.0f}{100*v/tot:>7.1f}%')
+
+# --- 6. turnaround slack -------------------------------------------------
+trt = [value(instance.TRT[p]) for p in P]
+ND = value(instance.ND)
+print(f'\nTRT  {min(trt):.1f} - {max(trt):.1f} d   ND = {ND}   '
+      f'at limit: {sum(1 for x in trt if x > ND-0.5)}/{len(P)}')
+
+# --- 7. transport mode split --------------------------------------------
+print()
+for lbl, V, idx in [('LS->MS  ', instance.Y1, 3), ('MS->hosp', instance.Y2, 3)]:
+    cnt = {}
+    for k in V:
+        if value(V[k]) > 0.5:
+            cnt[k[idx]] = cnt.get(k[idx], 0) + 1
+    print(f'{lbl} mode split: {cnt}')
+print('='*70)
+
 print("CPU time:", t1_stop-t1_start)
 print('-----------------------------------------------------------------------------------------------------------------------')
 print('-----------------------------------------------------------------------------------------------------------------------')
@@ -550,4 +734,6 @@ for i in range(0,Nh):
     plt.text(hospitalX[Nh-i-1]+0.03,hospitalY[Nh-i-1],'H'+str(i+1),fontweight='bold')    
 plt.axis('off')
 
-fig.savefig('network.png')
+fig.savefig(os.path.join(RUN_DIR, 'network.png'))
+from_instance(instance, outfile=os.path.join(RUN_DIR, 'utilisation.png'))
+sys.stdout.close()

@@ -1,0 +1,15 @@
+# Ignore everything by default
+*
+
+# ...except the files we actually want tracked
+!.gitignore
+!model_CART_iSHIPMENT_200p_22D_NCM_t2.py
+!model_CART_iSHIPMENT_200p_22D_t2.py
+!Data200_profileA.dat
+!capex_scaling.npz
+!capex_surrogate.onnx
+!capex_surrogate.onnx.data
+!opex_scaling.npz
+!opex_surrogate.onnx
+!opex_surrogate.onnx.data
+!surrogate_params.py
